@@ -59,6 +59,8 @@ class GraphDocConfig(LayoutLMv2Config):
         pos_embed_size=24,
         expand_wh_scale=5.0,
         use_visual_input=True,
+        use_visual_patch_tokens=True,
+        visual_patch_grid_size=14,
         use_abs_emb=True,
         use_rel_2d=False,
         use_rel_emb=True,
@@ -137,6 +139,8 @@ class GraphDocConfig(LayoutLMv2Config):
         self.bdp_alpha = bdp_alpha
         self.bdp_blocks = bdp_blocks
         self.use_abs_emb = use_abs_emb
+        self.use_visual_patch_tokens = use_visual_patch_tokens
+        self.visual_patch_grid_size = visual_patch_grid_size
         self.use_mvm = use_mvm
         self.is_cover = is_cover
         self.mvm_alpha = mvm_alpha
