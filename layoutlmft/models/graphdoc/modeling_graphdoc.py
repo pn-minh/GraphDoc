@@ -313,15 +313,20 @@ class VisualTokenExtractor(nn.Module):
         self.scale = 0.25
         self.pool = RoiFeatExtraxtor(self.scale)
 
-    def forward(self, images, line_bboxes):
+    def forward(self, images, line_bboxes, return_patch_tokens=False, patch_grid_size=14):
         if isinstance(images, torch.Tensor):
             images_input = (images - self.pixel_mean) / self.pixel_std
         else:
             images_input = (images.tensor - self.pixel_mean) / self.pixel_std
         features = self.backbone(images_input)
         features = features[0]
-        features = self.pool(features, line_bboxes)
-        return features
+        roi_features = self.pool(features, line_bboxes)
+        if not return_patch_tokens:
+            return roi_features
+
+        patch_features = F.adaptive_avg_pool2d(features, (patch_grid_size, patch_grid_size))
+        patch_features = patch_features.flatten(2).transpose(1, 2).contiguous()
+        return roi_features, patch_features
 
 
 class GraphDocSelfAttention(nn.Module):
@@ -818,13 +823,19 @@ class GraphDocModel(LayoutLMv2PreTrainedModel):
     def __init__(self, config):
         super(GraphDocModel, self).__init__(config)
         self.config = config
+        self.has_relative_attention_bias = config.has_relative_attention_bias
         self.has_visual_segment_embedding = config.has_visual_segment_embedding
         self.embeddings = GraphDocEmbeddings(config)
 
         self.use_visual_input = config.use_visual_input
+        self.use_visual_patch_tokens = config.use_visual_patch_tokens
+        self.visual_patch_grid_size = config.visual_patch_grid_size
         if self.use_visual_input:
             self.visual = VisualTokenExtractor(config)
             self.visual_proj = nn.Linear(config.vision_size, config.hidden_size)
+            if self.use_visual_patch_tokens:
+                self.visual_patch_proj = nn.Linear(config.vision_size, config.hidden_size)
+                self.visual_patch_placeholder = nn.Parameter(torch.zeros(1, 1, config.hidden_size))
             if self.has_visual_segment_embedding:
                 self.visual_segment_embedding = nn.Parameter(nn.Embedding(1, config.hidden_size).weight[0])
             self.visual_LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
@@ -865,7 +876,19 @@ class GraphDocModel(LayoutLMv2PreTrainedModel):
 
     def _calc_img_embeddings(self, image, bbox):
         if self.use_visual_input:
-            visual_embeddings = self.visual_proj(self.visual(image, bbox))
+            visual_features = self.visual(
+                image,
+                bbox,
+                return_patch_tokens=self.use_visual_patch_tokens,
+                patch_grid_size=self.visual_patch_grid_size,
+            )
+            if self.use_visual_patch_tokens:
+                roi_features, patch_features = visual_features
+                visual_embeddings = self.visual_proj(roi_features)
+                patch_embeddings = self.visual_patch_proj(patch_features)
+                patch_embeddings = self.visual_dropout(patch_embeddings)
+            else:
+                visual_embeddings = self.visual_proj(visual_features)
             spatial_position_embeddings = self.embeddings._cal_spatial_position_embeddings(bbox)
             if spatial_position_embeddings is not None:
                 embeddings = visual_embeddings + spatial_position_embeddings
@@ -873,9 +896,21 @@ class GraphDocModel(LayoutLMv2PreTrainedModel):
                 embeddings = visual_embeddings
             embeddings = self.visual_LayerNorm(embeddings)
             embeddings = self.visual_dropout(embeddings)
-            return embeddings
+            if self.use_visual_patch_tokens:
+                return embeddings, patch_embeddings
+            return embeddings, None
         else:
-            return None
+            return None, None
+
+    def _make_patch_bboxes(self, batch_size, device):
+        grid_size = self.visual_patch_grid_size
+        coordinates = torch.arange(grid_size, device=device, dtype=torch.long)
+        starts = coordinates * 1000 // grid_size
+        ends = (coordinates + 1) * 1000 // grid_size
+        y1, x1 = torch.meshgrid(starts, starts)
+        y2, x2 = torch.meshgrid(ends, ends)
+        patch_bboxes = torch.stack((x1, y1, x2, y2), dim=-1).reshape(1, -1, 4)
+        return patch_bboxes.expand(batch_size, -1, -1)
 
     def forward(
         self,
@@ -918,8 +953,36 @@ class GraphDocModel(LayoutLMv2PreTrainedModel):
             bbox = torch.zeros(tuple(list(input_shape) + [4]), dtype=torch.long, device=device)
 
         text_layout_emb = self._calc_text_embeddings(input_ids=input_sentences, input_ids_masks=input_sentences_masks, input_embeds=inputs_embeds, bbox=bbox)
+        visual_layout_emb, visual_patch_emb = self._calc_img_embeddings(image=image, bbox=bbox)
+
+        if self.use_visual_patch_tokens:
+            batch_size = text_layout_emb.shape[0]
+            patch_bboxes = self._make_patch_bboxes(batch_size, text_layout_emb.device)
+            patch_count = patch_bboxes.shape[1]
+            patch_text_emb = self.visual_patch_placeholder.expand(batch_size, patch_count, -1)
+            patch_spatial_emb = self.embeddings._cal_spatial_position_embeddings(patch_bboxes)
+            if patch_spatial_emb is not None:
+                patch_text_emb = patch_text_emb + patch_spatial_emb
+                visual_patch_emb = visual_patch_emb + patch_spatial_emb
+            text_layout_emb = torch.cat((patch_text_emb, text_layout_emb), dim=1)
+            visual_layout_emb = torch.cat((visual_patch_emb, visual_layout_emb), dim=1)
+            bbox = torch.cat((patch_bboxes, bbox), dim=1)
+            patch_mask = torch.ones(
+                (batch_size, patch_count), dtype=attention_mask.dtype, device=attention_mask.device
+            )
+            attention_mask = torch.cat((patch_mask, attention_mask), dim=1)
+            if position_ids is not None:
+                patch_position_ids = torch.arange(
+                    patch_count, device=position_ids.device
+                ).unsqueeze(0).expand(batch_size, -1)
+                position_ids = torch.cat((patch_position_ids, position_ids + patch_count), dim=1)
+
+        if position_ids is None and self.has_relative_attention_bias:
+            position_ids = torch.arange(
+                text_layout_emb.shape[1], device=text_layout_emb.device
+            ).unsqueeze(0).expand(text_layout_emb.shape[0], -1)
+
         rel_bbox_emb, rel_bbox_index = self.embeddings._cal_rel_position_embeddings(bbox=bbox, bbox_mask=attention_mask)
-        visual_layout_emb = self._calc_img_embeddings(image=image, bbox=bbox)
 
         extended_attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)
         extended_attention_mask = extended_attention_mask.to(dtype=self.dtype)
@@ -1094,7 +1157,9 @@ class GraphDocForPretrain(LayoutLMv2PreTrainedModel):
 
         batch_size = unmask_embed.size(0) # B
         seq_length = unmask_embed.size(1) # L
-        sequence_output, pooler_output = outputs[0][:, :seq_length], outputs[1]
+        patch_count = self.layoutclm.visual_patch_grid_size ** 2 if self.config.use_visual_patch_tokens else 0
+        sequence_output = outputs[0][:, patch_count:patch_count + seq_length]
+        pooler_output = outputs[1]
         sequence_output = self.sequence_dropout(sequence_output)
 
         # document type classification
@@ -1226,7 +1291,9 @@ class GraphDocForTokenClassification(LayoutLMv2PreTrainedModel):
         )
             
         seq_length = inputs_embeds.size(1)
-        sequence_output, image_output = outputs[0][:, :seq_length], outputs[0][:, seq_length:]
+        patch_count = self.layoutclm.visual_patch_grid_size ** 2 if self.config.use_visual_patch_tokens else 0
+        sequence_output = outputs[0][:, patch_count:patch_count + seq_length]
+        image_output = outputs[0][:, patch_count + seq_length:]
         sequence_output = self.dropout(sequence_output)
         logits = self.classifier(sequence_output)
 
