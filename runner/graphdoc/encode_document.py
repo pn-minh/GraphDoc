@@ -86,7 +86,10 @@ sentence_bert = AutoModel.from_pretrained(sentence_model_path)
 sentence_bert = sentence_bert.cuda().eval()
 
 # prepare input data
-input_H = 512; input_W = 512
+if config.use_visual_patch_tokens:
+    input_H = 224; input_W = 224
+else:
+    input_H = 512; input_W = 512
 image = cv2.imread(image_path)
 H, W = image.shape[:2]
 ratio_H = input_H / H; ratio_W = input_W / W
@@ -95,10 +98,12 @@ polys, contents = read_ocr(ocr_path)
 bboxes = polys2bboxes(polys)
 bboxes[:, 0::2] = bboxes[:, 0::2] * ratio_W
 bboxes[:, 1::2] = bboxes[:, 1::2] * ratio_H
+if config.use_visual_patch_tokens:
+    bboxes = (bboxes / input_W * 1000).astype('int64')
 sentence_embeddings = extract_sentence_embeddings(contents, tokenizer, sentence_bert)
 
 # append global node
-global_bbox = np.array([0, 0, 512,512]).astype('int64')
+global_bbox = np.array([0, 0, 1000, 1000] if config.use_visual_patch_tokens else [0, 0, 512, 512]).astype('int64')
 bboxes = np.concatenate([global_bbox[None, :], bboxes], axis=0)
 global_embed = np.zeros_like(sentence_embeddings[0])
 sentence_embeddings = np.concatenate([global_embed[None, :], sentence_embeddings], axis=0)
