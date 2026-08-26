@@ -27,8 +27,27 @@ def compute_metrics(eval_prediction):
     predictions, labels = eval_prediction
     predicted_labels = np.argmax(predictions, axis=-1)
     active = labels != -100
-    accuracy = (predicted_labels[active] == labels[active]).mean()
-    return {"accuracy": float(accuracy)}
+    predicted_labels = predicted_labels[active]
+    labels = labels[active]
+    accuracy = (predicted_labels == labels).mean()
+
+    class_f1 = []
+    for label_id in range(7):
+        true_positive = np.sum((predicted_labels == label_id) & (labels == label_id))
+        false_positive = np.sum((predicted_labels == label_id) & (labels != label_id))
+        false_negative = np.sum((predicted_labels != label_id) & (labels == label_id))
+        denominator = 2 * true_positive + false_positive + false_negative
+        class_f1.append(0.0 if denominator == 0 else 2 * true_positive / denominator)
+
+    return {
+        "accuracy": float(accuracy),
+        "f1_micro": float(accuracy),
+        "f1_macro": float(np.mean(class_f1)),
+        "f1_O": float(class_f1[0]),
+        "f1_HEADER": float((class_f1[1] + class_f1[2]) / 2),
+        "f1_QUESTION": float((class_f1[3] + class_f1[4]) / 2),
+        "f1_ANSWER": float((class_f1[5] + class_f1[6]) / 2),
+    }
 
 
 def set_trainable_parameters(model, train_backbone):
@@ -55,12 +74,17 @@ def main():
     parser.add_argument("--gradient-accumulation-steps", type=int, default=8)
     parser.add_argument("--max-steps", type=int, default=-1)
     parser.add_argument("--train-backbone", action="store_true")
+    parser.add_argument(
+        "--legacy",
+        action="store_true",
+        help="Disable the 196 visual patch tokens for a legacy baseline.",
+    )
     parser.add_argument("--skip-sanity-check", action="store_true")
     args = parser.parse_args()
 
     dataset = load_from_disk(args.dataset_dir)
     config = GraphDocConfig.from_pretrained(args.model_dir)
-    config.use_visual_patch_tokens = True
+    config.use_visual_patch_tokens = not args.legacy
     config.visual_patch_grid_size = 14
     config.num_labels = 7
 
